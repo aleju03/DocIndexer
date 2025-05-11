@@ -4,7 +4,7 @@ import sys
 import redis
 import threading
 import time # Added for the __main__ test block
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple, List # Added List
 import logging # Import logging
 
 # Relative import for models, assuming this file is part of the 'app' package
@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 # --- Configuration ---
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
-TASK_QUEUE_NAME = os.getenv('REDIS_TASK_QUEUE', 'doc_processing_tasks')
+# TASK_QUEUE_NAME is no longer a single global queue name, but a prefix.
+TASK_QUEUE_PREFIX = os.getenv('REDIS_TASK_QUEUE_PREFIX', 'doc_processing_tasks') 
 RESULTS_CHANNEL_NAME = os.getenv('REDIS_RESULTS_CHANNEL', 'idx_partial_results')
 
 # --- Redis Client Initialization ---
@@ -48,23 +49,63 @@ def get_publisher_redis_client():
 
 # Note: Subscriber client is created per-thread in start_results_listener
 
-def get_least_loaded_worker(redis_conn):
-    worker_keys = redis_conn.keys("worker_status:*")
-    min_load = float('inf')
-    selected_worker = None
-    for key in worker_keys:
-        status = redis_conn.hgetall(key)
+def get_least_loaded_worker(redis_conn: redis.Redis) -> Optional[str]:
+    """
+    Selects a worker based primarily on its current task queue length,
+    and secondarily by reported CPU + RAM load.
+    """
+    worker_status_keys = redis_conn.keys("worker_status:*")
+    if not worker_status_keys:
+        logger.warning("get_least_loaded_worker: No worker_status keys found in Redis.")
+        return None
+
+    candidate_workers: List[Tuple[str, int, float]] = [] # worker_id, queue_length, load_metric
+
+    for key_bytes in worker_status_keys:
+        key = key_bytes.decode('utf-8')
+        worker_id_from_key = key.split(":", 1)[1]
+        
+        # Check TTL to ensure worker is somewhat recent/alive
+        ttl = redis_conn.ttl(key)
+        if ttl < 0 and ttl != -1: # -2 means key doesn't exist (shouldn't happen here), -1 means no expire
+            logger.debug(f"get_least_loaded_worker: Worker {worker_id_from_key} status key has expired or no TTL ({ttl}). Skipping.")
+            continue
+
+        status_data_bytes = redis_conn.hgetall(key)
+        status_data = {k.decode('utf-8'): v.decode('utf-8') for k, v in status_data_bytes.items()}
+
         try:
-            cpu = float(status.get(b'cpu', 100))
-            ram = float(status.get(b'ram', 100))
-        except Exception:
-            cpu = 100
-            ram = 100
-        load = cpu + ram
-        if load < min_load:
-            min_load = load
-            selected_worker = key.decode().split(":")[1]
-    return selected_worker
+            cpu_str = status_data.get('cpu')
+            ram_str = status_data.get('ram')
+            
+            cpu = float(cpu_str) if cpu_str is not None else 100.0 # Default to high load if missing
+            ram = float(ram_str) if ram_str is not None else 100.0 # Default to high load if missing
+        except (ValueError, TypeError) as e:
+            logger.warning(f"get_least_loaded_worker: Error parsing status for worker {worker_id_from_key}: {e}. Defaulting to high load.")
+            cpu = 100.0
+            ram = 100.0
+        
+        load_metric = cpu + ram
+
+        worker_specific_queue_name = f"{TASK_QUEUE_PREFIX}:{worker_id_from_key}"
+        queue_length = redis_conn.llen(worker_specific_queue_name)
+        if queue_length is None: # Should not happen with llen, but good to be safe
+            logger.warning(f"get_least_loaded_worker: Could not get queue length for {worker_specific_queue_name}. Assuming high load.")
+            queue_length = float('inf') # Effectively remove from consideration if llen fails
+
+        candidate_workers.append((worker_id_from_key, queue_length, load_metric))
+        logger.debug(f"get_least_loaded_worker: Candidate {worker_id_from_key} - QLen: {queue_length}, CPU: {cpu:.2f}, RAM: {ram:.2f}, Load: {load_metric:.2f}")
+
+    if not candidate_workers:
+        logger.warning("get_least_loaded_worker: No valid candidate workers found after checking status and queue length.")
+        return None
+
+    # Sort: first by queue_length (ascending), then by load_metric (ascending)
+    candidate_workers.sort(key=lambda x: (x[1], x[2]))
+
+    selected_worker_id = candidate_workers[0][0]
+    logger.info(f"get_least_loaded_worker: Selected worker {selected_worker_id} (QLen: {candidate_workers[0][1]}, Load: {candidate_workers[0][2]:.2f}) from {len(candidate_workers)} candidates.")
+    return selected_worker_id
 
 # --- Task Publishing ---
 def push_task_to_queue(doc_task: DocumentTask) -> Optional[int]:
@@ -75,12 +116,24 @@ def push_task_to_queue(doc_task: DocumentTask) -> Optional[int]:
     """
     try:
         r_client = get_publisher_redis_client()
-        task_json = doc_task.model_dump_json() # Pydantic v2+ method
+        if not r_client: # Ensure client is available
+             logger.error("Task Queue: Cannot push task, Redis publisher client is not available.")
+             return None
+
+        task_json = doc_task.model_dump_json()
+        
+        # Use the improved selection logic
         worker_id = get_least_loaded_worker(r_client)
+        
         if not worker_id:
-            logger.error("No available workers found to assign the task.")
+            logger.error("Task Queue: No available or suitable workers found to assign the task.")
             return None
-        queue_name = f"doc_processing_tasks:{worker_id}"
+            
+        # Construct the queue name for the selected worker
+        # TASK_QUEUE_PREFIX is used here, e.g., "doc_processing_tasks"
+        # So queue_name becomes e.g. "doc_processing_tasks:worker-xyz-123"
+        queue_name = f"{TASK_QUEUE_PREFIX}:{worker_id}"
+        
         logger.debug(f"Pushing task for doc_id: {doc_task.doc_id} to queue '{queue_name}' (assigned to worker {worker_id})")
         return r_client.rpush(queue_name, task_json)
     except redis.exceptions.RedisError as e:
@@ -198,7 +251,7 @@ if __name__ == '__main__':
         
         from backend.shared.text_utils import normalize_text # Changed from preprocess_text
         logger.info("Initializing NLTK (via text_utils.normalize_text import for test)...")
-        normalize_text("test for nltk init") # Call the correct function
+        normalize_text("test for nltk init", language="english") # Call the correct function
         logger.info("NLTK init call done for task_queue.py test.")
     except ImportError:
         logger.error("Could not import normalize_text for NLTK init in task_queue.py test. Path issue?", exc_info=True)
@@ -206,19 +259,53 @@ if __name__ == '__main__':
         logger.error(f"Could not pre-initialize NLTK in task_queue.py test: {e}", exc_info=True)
 
     # Test task publishing
-    logger.info("\n--- Testing Task Publishing ---")
-    sample_task = DocumentTask(doc_id=f"test_doc_{int(time.time())}.txt", content="This is test document content for task_queue.")
+    logger.info("\n--- Testing Task Publishing (with new get_least_loaded_worker) ---")
+    sample_task = DocumentTask(doc_id=f"test_doc_{int(time.time())}.txt", content="This is test document content for task_queue with improved load balancing.")
     try:
-        pushed_len = push_task_to_queue(sample_task)
-        if pushed_len is not None: 
-            logger.info(f"Pushed task for {sample_task.doc_id}. Queue '{TASK_QUEUE_NAME}' length: {pushed_len}")
-        else: 
-            logger.error(f"Failed to push task for {sample_task.doc_id}. Check Redis connection and logs.")
+        # To properly test get_least_loaded_worker, mock Redis or ensure worker statuses and queues exist.
+        # For a simple run, we can just call it.
+        mock_redis_client = get_publisher_redis_client()
+        if mock_redis_client:
+            logger.info("Simulating worker statuses and queues for testing get_least_loaded_worker:")
+            # Ensure some worker statuses exist for the test to pick one
+            # Example: worker-test-1, worker-test-2
+            mock_redis_client.hmset("worker_status:worker-test-1", {"cpu": "10", "ram": "20"})
+            mock_redis_client.expire("worker_status:worker-test-1", 10)
+            mock_redis_client.rpush(f"{TASK_QUEUE_PREFIX}:worker-test-1", "task1") # QLen = 1
+            
+            mock_redis_client.hmset("worker_status:worker-test-2", {"cpu": "5", "ram": "10"})
+            mock_redis_client.expire("worker_status:worker-test-2", 10)
+            # worker-test-2 has QLen = 0 (no tasks pushed to its specific queue yet)
+
+            mock_redis_client.hmset("worker_status:worker-test-3", {"cpu": "50", "ram": "60"})
+            mock_redis_client.expire("worker_status:worker-test-3", 10)
+            mock_redis_client.rpush(f"{TASK_QUEUE_PREFIX}:worker-test-3", "task_a")
+            mock_redis_client.rpush(f"{TASK_QUEUE_PREFIX}:worker-test-3", "task_b") # QLen = 2
+
+            logger.info("Calling get_least_loaded_worker...")
+            selected = get_least_loaded_worker(mock_redis_client)
+            logger.info(f"Test: get_least_loaded_worker selected: {selected}") # Expect worker-test-2
+
+            pushed_len = push_task_to_queue(sample_task)
+            if pushed_len is not None: 
+                worker_for_task = selected if selected else "(selected by actual call if different)"
+                logger.info(f"Pushed task for {sample_task.doc_id} to worker '{worker_for_task}'. Assigned queue length: {pushed_len}")
+            else: 
+                logger.error(f"Failed to push task for {sample_task.doc_id}. Check Redis connection and logs.")
+
+            # Clean up test keys
+            mock_redis_client.delete("worker_status:worker-test-1", f"{TASK_QUEUE_PREFIX}:worker-test-1")
+            mock_redis_client.delete("worker_status:worker-test-2", f"{TASK_QUEUE_PREFIX}:worker-test-2") # Assuming queue for test-2 might be created
+            mock_redis_client.delete("worker_status:worker-test-3", f"{TASK_QUEUE_PREFIX}:worker-test-3")
+
+        else:
+            logger.error("Cannot run full push_task_to_queue test, Redis client unavailable.")
+
     except Exception as e_pub:
         logger.error(f"Error during task push test: {e_pub}", exc_info=True)
 
     # Test results listener
-    logger.info("\n--- Testing Results Listener ---")
+    logger.info("\n--- Testing Results Listener (no changes to listener logic itself) ---")
     test_stop_event = threading.Event()
     received_data_storage = [] # To store data received by the handler
 

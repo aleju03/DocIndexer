@@ -19,6 +19,7 @@ import redis
 import gzip
 
 from fastapi import FastAPI, HTTPException, Form
+from fastapi.middleware.cors import CORSMiddleware
 
 # --- Logging Setup ---
 LOG_LEVEL_STR = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -148,6 +149,15 @@ app = FastAPI(
     description="Manages document indexing tasks and provides search functionality.",
     version="0.1.0",
     lifespan=lifespan
+)
+
+# CORS Middleware Configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # Adjust if your frontend runs on a different port
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- API Endpoints ---

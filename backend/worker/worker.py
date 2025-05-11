@@ -16,10 +16,6 @@ logging.basicConfig(level=LOG_LEVEL,
 logger = logging.getLogger(__name__)
 
 # --- Path setup for imports ---
-# Ensure 'backend.shared' can be imported when running worker.py directly
-# worker.py is in .../backend/worker/
-# We want to add .../ (the parent of 'backend') to sys.path
-# so that 'from backend.shared...' works.
 _worker_dir = os.path.dirname(os.path.abspath(__file__))
 _backend_dir = os.path.dirname(_worker_dir)
 _project_root_parent = os.path.dirname(_backend_dir)
@@ -36,7 +32,6 @@ except ImportError as e:
         def normalize_text(text:str, language:str="english") -> list[str]: 
             logger.critical("CRITICAL: normalize_text STUB is active. Text processing will fail.")
             return text.split()
-        # sys.exit(1) # Consider exiting if core functionality is missing
 
 # --- Configuration ---
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
@@ -55,6 +50,11 @@ WORKER_ID_LOG_PREFIX = f"[{os.getenv('HOSTNAME', 'local_host')}-{os.getpid()}]" 
 
 # --- Redis Connection ---
 redis_client = None
+
+# Get a psutil.Process instance for the current process
+
+_current_process = psutil.Process(os.getpid())
+_num_cores = psutil.cpu_count() # Get number of logical CPU cores
 
 def get_redis_client():
     """Establishes and returns a Redis client connection."""
@@ -115,8 +115,7 @@ def process_document_task(task_data_json: str):
         processed_tokens = normalize_text(content, language=language_to_use)
         if not processed_tokens:
             logger.info(f"Doc ID {doc_id}: No tokens after normalization. Skipping TF calculation.")
-            # Optionally, still publish a result indicating no processable content if coordinator expects a message for every task
-            # For now, we just skip publishing if no tokens.
+            
             return
 
         logger.debug(f"Doc ID {doc_id}: Original words (approx) {len(content.split())}, Processed tokens {len(processed_tokens)}")
@@ -145,13 +144,9 @@ def process_document_task(task_data_json: str):
         logger.error(f"Task data missing 'doc_id' or 'content'. Data: {str(task_data)[:200]}", exc_info=True)
     except redis.exceptions.RedisError as e:
         logger.error(f"Redis communication error processing task for doc_id {doc_id_for_logging}: {e}", exc_info=True)
-        # This might indicate a need to re-establish connection or handle specific Redis errors.
-        # For publish errors, the task is processed but result not sent. Consider retry or logging for recovery.
+        
     except Exception as e:
         logger.error(f"Unexpected error processing task for doc_id '{doc_id_for_logging}': {e}", exc_info=True)
-        # Optionally, log the full traceback here for debugging
-        # import traceback
-        # print(traceback.format_exc())
 
 def report_status_periodically(redis_conn, worker_id, interval=2):
     prev_cpu = -1.0  # Initialize to ensure first report always happens
@@ -159,25 +154,37 @@ def report_status_periodically(redis_conn, worker_id, interval=2):
     status_key = f"worker_status:{worker_id}"
     ttl_seconds = interval * 3 # e.g., if interval is 2s, TTL is 6s
 
+    # Call cpu_percent once initially without sending, to establish a baseline for subsequent calls.
+    # This is because the first call to process.cpu_percent(interval=None) returns 0.
+    _current_process.cpu_percent() 
+    time.sleep(0.1) # Small delay before starting the loop for more accurate first % reading
+
     while True:
-        current_cpu = psutil.cpu_percent()
-        current_ram = psutil.virtual_memory().percent
+        # Get CPU and RAM for the current process
+        raw_cpu_percent = _current_process.cpu_percent()
+        
+        # Normalize CPU percent by number of cores
+        # If _num_cores is 0 or None for some reason, avoid division by zero, though psutil.cpu_count() should be reliable.
+        normalized_cpu = (raw_cpu_percent / _num_cores) if _num_cores else raw_cpu_percent
+        
+        current_ram = _current_process.memory_percent() # Defaults to RSS
 
         # Report only if there's a significant change or it's the first report
-        if abs(current_cpu - prev_cpu) > 2 or abs(current_ram - prev_ram) > 2 or prev_cpu == -1.0:
+        if abs(normalized_cpu - prev_cpu) > 0.01 or abs(current_ram - prev_ram) > 0.01 or prev_cpu == -1.0:
             status_data = {
-                "cpu": current_cpu,
+                "cpu": normalized_cpu, # Send normalized CPU
                 "ram": current_ram,
             }
             try:
                 redis_conn.hset(status_key, mapping=status_data)
-                logger.debug(f"Reported status for {worker_id}: CPU {current_cpu:.1f}%, RAM {current_ram:.1f}%")
-                prev_cpu = current_cpu
+                # Log with more precision for debugging
+                logger.debug(f"Reported status for {worker_id}: CPU {normalized_cpu:.2f}% (raw: {raw_cpu_percent:.2f}%), RAM {current_ram:.2f}%")
+                prev_cpu = normalized_cpu
                 prev_ram = current_ram
             except redis.exceptions.RedisError as e:
                 logger.warning(f"Could not report status for {worker_id} to Redis: {e}")
         else:
-            logger.debug(f"Status for {worker_id} unchanged (CPU {current_cpu:.1f}%, RAM {current_ram:.1f}%), skipping HMSET.")
+            logger.debug(f"Status for {worker_id} largely unchanged (CPU {normalized_cpu:.2f}%, RAM {current_ram:.2f}%), skipping HMSET.")
 
         # Always update TTL to keep the key alive as long as the worker is running
         try:
@@ -192,7 +199,8 @@ def main_loop():
     Main loop for the worker. Fetches tasks from the Redis queue and processes them.
     """
     logger.info(f"Worker starting. Default processing language: {PROCESSING_LANGUAGE.upper()}.")
-    logger.info(f"Waiting for tasks on Redis queue '{{worker_queue}}'. Log level: {LOG_LEVEL_STR}")
+    logger.info(f"Waiting for tasks on Redis queue 'doc_processing_tasks:{WORKER_ID}'. Log level: {LOG_LEVEL_STR}")
+    logger.info(f"Number of logical CPU cores detected: {_num_cores if _num_cores else 'Unknown'}")
     
     # NLTK resources (stopwords) are downloaded by text_utils.py on its first import/use.
     # No explicit pre-initialization call needed here anymore.
@@ -205,9 +213,15 @@ def main_loop():
         try:
             if r_client is None:
                 r_client = get_redis_client()
-                if status_thread is None:
+                if status_thread is None and r_client: # Ensure r_client is valid
                     status_thread = threading.Thread(target=report_status_periodically, args=(r_client, WORKER_ID), daemon=True)
                     status_thread.start()
+                    logger.info(f"Status reporting thread started for {WORKER_ID}.")
+
+            if not r_client: # If still no client after attempt, wait and retry
+                logger.warning("No Redis client for task fetching, retrying connection soon...")
+                time.sleep(5)
+                continue
 
             task_tuple = r_client.blpop(worker_queue, timeout=5)
             if task_tuple:
@@ -219,8 +233,12 @@ def main_loop():
 
         except redis.exceptions.ConnectionError as e:
             logger.error(f"Redis connection error in main loop: {e}. Attempting to reconnect in 5 seconds...", exc_info=True)
-            redis_client = None # Reset global client to trigger reconnection attempt in next iteration
-            r_client = None     # Reset local r_client
+            if status_thread and status_thread.is_alive():
+                 logger.info("Attempting to gracefully stop status thread due to main loop Redis error...")
+                 # No direct stop for thread, rely on daemon and program exit or internal error handling in thread
+            status_thread = None # Reset status thread so it can be restarted if redis reconnects
+            redis_client = None 
+            r_client = None     
             time.sleep(5)
         except KeyboardInterrupt:
             logger.info("Shutdown signal (KeyboardInterrupt) received. Exiting gracefully.")
