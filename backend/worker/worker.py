@@ -165,26 +165,27 @@ def report_status_periodically(redis_conn, worker_id, interval=2):
         
         # Normalize CPU percent by number of cores
         # If _num_cores is 0 or None for some reason, avoid division by zero, though psutil.cpu_count() should be reliable.
-        normalized_cpu = (raw_cpu_percent / _num_cores) if _num_cores else raw_cpu_percent
+        # normalized_cpu = (raw_cpu_percent / _num_cores) if _num_cores else raw_cpu_percent # Commenting out normalization
         
         current_ram = _current_process.memory_percent() # Defaults to RSS
 
         # Report only if there's a significant change or it's the first report
-        if abs(normalized_cpu - prev_cpu) > 0.01 or abs(current_ram - prev_ram) > 0.01 or prev_cpu == -1.0:
+        # Update condition to use raw_cpu_percent instead of normalized_cpu for comparison
+        if abs(raw_cpu_percent - prev_cpu) > 0.01 or abs(current_ram - prev_ram) > 0.01 or prev_cpu == -1.0:
             status_data = {
-                "cpu": normalized_cpu, # Send normalized CPU
+                "cpu": raw_cpu_percent, # Send raw CPU (relative to one core)
                 "ram": current_ram,
             }
             try:
                 redis_conn.hset(status_key, mapping=status_data)
                 # Log with more precision for debugging
-                logger.debug(f"Reported status for {worker_id}: CPU {normalized_cpu:.2f}% (raw: {raw_cpu_percent:.2f}%), RAM {current_ram:.2f}%")
-                prev_cpu = normalized_cpu
+                logger.debug(f"Reported status for {worker_id}: CPU {raw_cpu_percent:.2f}% (raw, per-core), RAM {current_ram:.2f}%")
+                prev_cpu = raw_cpu_percent # Store raw_cpu_percent for comparison
                 prev_ram = current_ram
             except redis.exceptions.RedisError as e:
                 logger.warning(f"Could not report status for {worker_id} to Redis: {e}")
         else:
-            logger.debug(f"Status for {worker_id} largely unchanged (CPU {normalized_cpu:.2f}%, RAM {current_ram:.2f}%), skipping HMSET.")
+            logger.debug(f"Status for {worker_id} largely unchanged (CPU {raw_cpu_percent:.2f}% raw, RAM {current_ram:.2f}%), skipping HMSET.")
 
         # Always update TTL to keep the key alive as long as the worker is running
         try:
