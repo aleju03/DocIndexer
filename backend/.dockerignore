@@ -1,0 +1,47 @@
+# Python stuff
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE and editor folders/files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Docker related (if docker-compose.yml is outside this dir and context is set higher)
+# For this project, docker-compose.yml is in this dir, so these aren't strictly needed here
+# but good practice if context changes.
+# Dockerfile # if you have multiple and want to ignore specific ones from context
+# docker-compose.yml
+# .dockerignore
+
+# Secrets / Sensitive Config (though .env is usually gitignored globally)
+.env
+*.env
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/ 

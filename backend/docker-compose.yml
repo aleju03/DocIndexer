@@ -1,0 +1,59 @@
+services:
+  redis:
+    image: "redis:alpine"
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data # Persist Redis data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: coordinator/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - COORDINATOR_PROCESSING_LANGUAGE=english # Default language for search query processing
+      - LOG_LEVEL=INFO # Example: set log level
+      - LOCAL_UPLOADS_PATH=/app/backend/uploads # Path inside container for local docs
+      - INDEX_FILE_STORAGE_PATH=/data/index.json # Path for index persistence
+    volumes:
+      # For development: mount the local 'uploads' directory to where the coordinator expects it.
+      # This allows you to drop files into backend/uploads on your host and have coordinator see them.
+      - ./uploads:/app/backend/uploads 
+      # Dedicated volume for persisting index.json at /data/index.json
+      - coordinator_index_data:/data 
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PROCESSING_LANGUAGE=english # Default language for worker processing
+      - LOG_LEVEL=INFO # Example: set log level for workers
+    depends_on:
+      redis:
+        condition: service_healthy
+    # No ports exposed for worker, it only communicates with Redis
+    # Use 'scale' to run multiple worker instances: docker-compose up --scale worker=3
+    deploy:
+      replicas: 2 # Start with 2 replicas by default for demonstration
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  coordinator_index_data:
+  # coordinator_index_data: # If using a separate volume for index persistence 
