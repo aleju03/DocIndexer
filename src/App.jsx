@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { FileText, Save, LayoutDashboard, SearchCheck } from 'lucide-react';
-import logo from './assets/KeySearch.png';
+import logo from './assets/DocIndexer.png';
 import Dashboard from './components/Dashboard';
 import SearchResultCard from './components/SearchResultCard';
 import Pagination from './components/Pagination';

@@ -1,6 +1,6 @@
-# KeySearch Project
+# DocIndexer Project
 
-KeySearch is a distributed document indexing and search system designed to process text documents, build an inverted index, and provide a fast keyword-based search.
+DocIndexer is a distributed document indexing and search system designed to process text documents, build an inverted index, and provide a fast keyword-based search.
 
 ## Architecture Overview
 
@@ -40,7 +40,7 @@ KeySearch is a distributed document indexing and search system designed to proce
 ## Project Structure
 
 ```
-keysearch/
+docindexer/
 ├── backend/
 │   ├── coordinator/            # Coordinator service (FastAPI app)
 │   │   ├── app/                # Main application logic, models, API endpoints
