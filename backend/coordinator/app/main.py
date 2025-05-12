@@ -154,16 +154,13 @@ app = FastAPI(
 # CORS Middleware Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Adjust if your frontend runs on a different port
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # --- API Endpoints ---
-
-# `/upload-documents/` endpoint has been intentionally removed based on user feedback
-# to use local directory scanning via `/trigger-local-indexing/`.
 
 @app.post("/trigger-local-indexing/", response_model=StatusResponse, status_code=202)
 async def trigger_local_indexing_endpoint(path: Optional[str] = Form(None, description="Optional path to scan for .txt files. Defaults to configured LOCAL_UPLOADS_PATH.")):

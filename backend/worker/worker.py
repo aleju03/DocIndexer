@@ -154,8 +154,6 @@ def report_status_periodically(redis_conn, worker_id, interval=2):
     status_key = f"worker_status:{worker_id}"
     ttl_seconds = interval * 3 # e.g., if interval is 2s, TTL is 6s
 
-    # Call cpu_percent once initially without sending, to establish a baseline for subsequent calls.
-    # This is because the first call to process.cpu_percent(interval=None) returns 0.
     _current_process.cpu_percent() 
     time.sleep(0.1) # Small delay before starting the loop for more accurate first % reading
 
@@ -163,11 +161,7 @@ def report_status_periodically(redis_conn, worker_id, interval=2):
         # Get CPU and RAM for the current process
         raw_cpu_percent = _current_process.cpu_percent()
         
-        # Normalize CPU percent by number of cores
-        # If _num_cores is 0 or None for some reason, avoid division by zero, though psutil.cpu_count() should be reliable.
-        # normalized_cpu = (raw_cpu_percent / _num_cores) if _num_cores else raw_cpu_percent # Commenting out normalization
-        
-        current_ram = _current_process.memory_percent() # Defaults to RSS
+        current_ram = _current_process.memory_percent()
 
         # Report only if there's a significant change or it's the first report
         # Update condition to use raw_cpu_percent instead of normalized_cpu for comparison
@@ -247,8 +241,6 @@ def main_loop():
         except Exception as e:
             # Catch-all for other unexpected errors in the main loop
             logger.critical(f"An unexpected error occurred in main_loop: {e}", exc_info=True)
-            # import traceback
-            # print(traceback.format_exc()) # For debugging
             logger.info("Waiting for 5 seconds before retrying...")
             time.sleep(5)
 

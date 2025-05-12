@@ -3,9 +3,9 @@ import os
 import sys
 import redis
 import threading
-import time # Added for the __main__ test block
-from typing import Callable, Optional, Tuple, List # Added List
-import logging # Import logging
+import time
+from typing import Callable, Optional, Tuple, List
+import logging
 
 # Relative import for models, assuming this file is part of the 'app' package
 # For linters or direct execution, sys.path might need adjustment if 'app' is not recognized.
@@ -204,7 +204,7 @@ def start_results_listener(
                 time.sleep(5)
             except Exception as e_thread:
                 logger.error(f"Task Queue (Thread {thread_id}): UNEXPECTED error in listener thread: {e_thread}. Retrying in 5s...", exc_info=True)
-                # import traceback; print(traceback.format_exc()) # For deeper debug
+
                 if pubsub: pubsub.close(); pubsub = None
                 if r_sub_client: r_sub_client.close(); r_sub_client = None
                 time.sleep(5)
@@ -223,132 +223,3 @@ def start_results_listener(
     listener.start()
     logger.info(f"Task Queue: Results listener thread ({listener.ident if listener.ident else 'N/A'}) dispatched for '{RESULTS_CHANNEL_NAME}'.")
     return listener
-
-# Example usage for testing this module directly (not part of the FastAPI app logic)
-if __name__ == '__main__':
-    # Setup basic logging for direct testing of this module if no handlers are configured
-    # This ensures that if this script is run directly, its logs are visible.
-    if not logging.getLogger().hasHandlers():
-        log_level_str_test = os.getenv("LOG_LEVEL", "DEBUG").upper()
-        logging.basicConfig(level=getattr(logging, log_level_str_test, logging.DEBUG),
-                            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
-    logger.info("--- Testing task_queue.py ---")
-
-    # Attempt to import normalize_text for the NLTK init call, similar to how worker/main do it.
-    # This is primarily for ensuring NLTK resources are available if this test is run standalone.
-    try:
-        # For this test block, we need to ensure backend.shared is accessible.
-        # This path adjustment is ONLY for this __main__ test block if run directly.
-        # The module itself relies on correct PYTHONPATH when used by the application.
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        app_dir = current_dir # task_queue.py is in app/
-        coordinator_dir = os.path.dirname(app_dir) # ../ -> coordinator/
-        backend_dir = os.path.dirname(coordinator_dir) # ../ -> backend/
-        project_root_parent = os.path.dirname(backend_dir) # ../ -> project root parent
-        if project_root_parent not in sys.path:
-            sys.path.insert(0, project_root_parent)
-        
-        from backend.shared.text_utils import normalize_text # Changed from preprocess_text
-        logger.info("Initializing NLTK (via text_utils.normalize_text import for test)...")
-        normalize_text("test for nltk init", language="english") # Call the correct function
-        logger.info("NLTK init call done for task_queue.py test.")
-    except ImportError:
-        logger.error("Could not import normalize_text for NLTK init in task_queue.py test. Path issue?", exc_info=True)
-    except Exception as e:
-        logger.error(f"Could not pre-initialize NLTK in task_queue.py test: {e}", exc_info=True)
-
-    # Test task publishing
-    logger.info("\n--- Testing Task Publishing (with new get_least_loaded_worker) ---")
-    sample_task = DocumentTask(doc_id=f"test_doc_{int(time.time())}.txt", content="This is test document content for task_queue with improved load balancing.")
-    try:
-        # To properly test get_least_loaded_worker, mock Redis or ensure worker statuses and queues exist.
-        # For a simple run, we can just call it.
-        mock_redis_client = get_publisher_redis_client()
-        if mock_redis_client:
-            logger.info("Simulating worker statuses and queues for testing get_least_loaded_worker:")
-            # Ensure some worker statuses exist for the test to pick one
-            # Example: worker-test-1, worker-test-2
-            mock_redis_client.hmset("worker_status:worker-test-1", {"cpu": "10", "ram": "20"})
-            mock_redis_client.expire("worker_status:worker-test-1", 10)
-            mock_redis_client.rpush(f"{TASK_QUEUE_PREFIX}:worker-test-1", "task1") # QLen = 1
-            
-            mock_redis_client.hmset("worker_status:worker-test-2", {"cpu": "5", "ram": "10"})
-            mock_redis_client.expire("worker_status:worker-test-2", 10)
-            # worker-test-2 has QLen = 0 (no tasks pushed to its specific queue yet)
-
-            mock_redis_client.hmset("worker_status:worker-test-3", {"cpu": "50", "ram": "60"})
-            mock_redis_client.expire("worker_status:worker-test-3", 10)
-            mock_redis_client.rpush(f"{TASK_QUEUE_PREFIX}:worker-test-3", "task_a")
-            mock_redis_client.rpush(f"{TASK_QUEUE_PREFIX}:worker-test-3", "task_b") # QLen = 2
-
-            logger.info("Calling get_least_loaded_worker...")
-            selected = get_least_loaded_worker(mock_redis_client)
-            logger.info(f"Test: get_least_loaded_worker selected: {selected}") # Expect worker-test-2
-
-            pushed_len = push_task_to_queue(sample_task)
-            if pushed_len is not None: 
-                worker_for_task = selected if selected else "(selected by actual call if different)"
-                logger.info(f"Pushed task for {sample_task.doc_id} to worker '{worker_for_task}'. Assigned queue length: {pushed_len}")
-            else: 
-                logger.error(f"Failed to push task for {sample_task.doc_id}. Check Redis connection and logs.")
-
-            # Clean up test keys
-            mock_redis_client.delete("worker_status:worker-test-1", f"{TASK_QUEUE_PREFIX}:worker-test-1")
-            mock_redis_client.delete("worker_status:worker-test-2", f"{TASK_QUEUE_PREFIX}:worker-test-2") # Assuming queue for test-2 might be created
-            mock_redis_client.delete("worker_status:worker-test-3", f"{TASK_QUEUE_PREFIX}:worker-test-3")
-
-        else:
-            logger.error("Cannot run full push_task_to_queue test, Redis client unavailable.")
-
-    except Exception as e_pub:
-        logger.error(f"Error during task push test: {e_pub}", exc_info=True)
-
-    # Test results listener
-    logger.info("\n--- Testing Results Listener (no changes to listener logic itself) ---")
-    test_stop_event = threading.Event()
-    received_data_storage = [] # To store data received by the handler
-
-    def dummy_handler(data: PartialIndexData):
-        logger.info(f"[DUMMY HANDLER] Received partial index for doc: {data.doc_id} from worker: {data.worker_id}")
-        # print(f"   Index fragment: {data.partial_index}") # Can be verbose
-        received_data_storage.append(data)
-        if len(received_data_storage) >= 1: # Stop after receiving one message for testing
-            logger.info("[DUMMY HANDLER] Received a message, signaling stop for test listener.")
-            test_stop_event.set()
-
-    logger.info(f"Starting dummy results listener on '{RESULTS_CHANNEL_NAME}'. Will wait for a message or timeout (20s).")
-    logger.info(f"To test: Run a worker, or manually publish a message to '{RESULTS_CHANNEL_NAME}' like:")
-    
-    # Construct the example JSON payload string for the redis-cli example command
-    example_payload_dict = {
-        "worker_id": "test_worker",
-        "doc_id": "test_doc.txt",
-        "partial_index": {
-            "termA": {"test_doc.txt": 1}
-        }
-    }
-    example_payload_json_str = json.dumps(example_payload_dict)
-    logger.info(f"   redis-cli PUBLISH {RESULTS_CHANNEL_NAME} '{example_payload_json_str}'")
-    
-    listener_thread_obj = start_results_listener(dummy_handler, test_stop_event)
-    
-    # Wait for the listener to pick up a message or timeout
-    listener_thread_obj.join(timeout=20) # Wait up to 20 seconds
-
-    if not test_stop_event.is_set():
-        logger.warning("Listener test timed out or did not receive expected messages. Signaling stop.")
-        test_stop_event.set() # Ensure it stops if timeout occurred before message
-        listener_thread_obj.join(timeout=5) # Give it a moment to clean up
-
-    if listener_thread_obj.is_alive():
-        logger.error("Listener thread did not terminate cleanly after stop signal.")
-    else:
-        logger.info("Listener thread terminated.")
-    
-    if received_data_storage:
-        logger.info(f"Successfully received {len(received_data_storage)} messages during listener test.")
-    else:
-        logger.warning("No messages received by the listener during the test period.")
-
-    logger.info("\n--- task_queue.py test finished. ---") 
